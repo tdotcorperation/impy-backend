@@ -1,74 +1,156 @@
 import sys
 import subprocess
-from flask import Flask
+import os
+from flask import Flask, request
 from flask_socketio import SocketIO, emit
+import eventlet # gunicorn -k eventlet을 위해 필요
 
 # 1. Flask 앱 및 SocketIO 초기화
 app = Flask(__name__)
-# cors_allowed_origins="*" 는 모든 프론트엔드에서의 연결을 허용합니다. (테스트용)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# 2. 사용자가 '연결'되었을 때 실행할 함수
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-    # 요청하신 터미널 첫 화면 문구 전송
-    emit('terminal_output', {'data': '(c) T;Dot.  All rights reserved.\n'})
-    emit('terminal_output', {'data': 'i❤️PY Render Backend. Ready.\n'})
-    emit('terminal_output', {'data': 'impy> '})
+# 2. 사용자(sid)별로 실행 중인 프로세스를 저장할 딕셔너리
+#    (보안: 여러 사용자가 동시 접속해도 섞이지 않게 함)
+user_processes = {}
 
-# 3. 사용자가 '연결 해제'되었을 때
-@socketio.on('disconnect')
-def handle_disconnect():
-    print('Client disconnected')
+# 3. input()을 가로채는 파이썬 코드 (핵심)
+#    이 코드가 사용자의 코드보다 '먼저' 실행됩니다.
+hack_script = """
+import sys
+import os
 
-# 4. 프론트엔드에서 'run_code' 이벤트를 보냈을 때 (핵심)
-@socketio.on('run_code')
-def handle_run_code(json):
-    code = json['code']
+# 1. 원래의 input 함수를 백업
+__original_input = input
+
+# 2. 새로운 '가짜' input 함수 정의
+def __custom_input(prompt=""):
+    # 3. 프롬프트(예: '이름: ')를 터미널로 보냄
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
     
-    # ================================================================
-    # !!!!!! 치명적인 보안 경고 !!!!!!
-    # 이 코드는 사용자가 보낸 문자열을 서버에서 '그대로' 실행합니다.
-    # 만약 사용자가 "import os; os.system('rm -rf /')" 를 보낸다면
-    # 이 서버가 파괴됩니다.
-    #
-    # 이것은 '장난감' 수준의 코드입니다. 
-    # 절대 이대로 실제 서비스에 사용해선 안 됩니다.
-    # (원래는 Docker 같은 격리된 환경에서 실행해야 합니다)
-    # ================================================================
+    # 4. "지금 입력 필요!"라는 비밀 신호를 보냄
+    sys.stdout.write("__INPUT_REQUEST__\\n")
+    sys.stdout.flush()
+    
+    # 5. 서버로부터 진짜 입력을 받을 때까지 대기
+    response = sys.stdin.readline()
+    
+    # 6. 받은 입력을 반환 (게임 코드는 자기가 입력받은 줄 앎)
+    return response.rstrip('\\n')
 
+# 7. 파이썬의 내장 input 함수를 우리가 만든 가짜 함수로 덮어쓰기
+__builtins__.input = __custom_input
+"""
+
+# 8. 백그라운드에서 터미널 출력을 실시간으로 스트리밍하는 함수
+def stream_output(process, sid):
     try:
-        # 'subprocess.Popen'을 사용하여 실시간으로 출력을 스트리밍합니다.
-        # 이것이 'tqdm' (프로그레스 바) 등을 가능하게 하는 핵심입니다.
-        process = subprocess.Popen(
-            [sys.executable, '-u', '-c', code], # -u 옵션: 버퍼링 없이 즉시 출력
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1 # 라인 단위 버퍼링
-        )
-
         # 1. 표준 출력(stdout) 스트리밍
         for line in process.stdout:
-            emit('terminal_output', {'data': line})
-            socketio.sleep(0.01) # 다른 작업도 처리할 수 있게 잠시 대기
+            # line에 비밀 신호가 있는지 확인
+            if "__INPUT_REQUEST__\n" in line:
+                # 'Name: __INPUT_REQUEST__\n' 처럼 붙어올 수 있음
+                prompt_text = line.replace("__INPUT_REQUEST__\n", "")
+                if prompt_text:
+                    socketio.emit('terminal_output', {'data': prompt_text}, to=sid)
+                socketio.emit('input_request', to=sid) # '입력 요청' 신호 전송
+            else:
+                socketio.emit('terminal_output', {'data': line}, to=sid)
+            socketio.sleep(0.01)
 
         # 2. 에러 출력(stderr) 스트리밍
         for line in process.stderr:
-            emit('terminal_output', {'data': f'[ERROR] {line}'})
+            socketio.emit('terminal_output', {'data': f'[ERROR] {line}'}, to=sid)
             socketio.sleep(0.01)
 
-        # 3. 프로세스 종료 대기
+    except Exception as e:
+        socketio.emit('terminal_output', {'data': f'\n[Stream Error] {e}\n'}, to=sid)
+    finally:
+        # 3. 프로세스가 끝나면 정리
         process.wait()
+        user_processes.pop(sid, None) # 딕셔너리에서 제거
+        socketio.emit('terminal_output', {'data': 'impy> '}, to=sid) # 프롬프트 전송
+
+
+# 9. 사용자가 '연결'되었을 때
+@socketio.on('connect')
+def handle_connect():
+    sid = request.sid
+    print(f"Client connected: {sid}")
+    # 요청하신 터미널 첫 화면 문구 전송
+    emit('terminal_output', {'data': '(c) T;Dot.  All rights reserved.\n'})
+    emit('terminal_output', {'data': 'i❤️PY Backend (input() enabled). Ready.\n'})
+    emit('terminal_output', {'data': 'impy> '}) # 프롬프트 전송
+
+# 10. 사용자가 '연결 해제'되었을 때
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    # 사용자가 나가면, 실행 중이던 프로세스 강제 종료
+    process = user_processes.pop(sid, None)
+    if process:
+        process.kill()
+    print(f"Client disconnected: {sid}")
+
+# 11. (신규) 사용자가 팝업창에 '입력'했을 때
+@socketio.on('user_input')
+def handle_user_input(json_data):
+    sid = request.sid
+    process = user_processes.get(sid)
+    data = json_data['data']
+
+    if process and process.poll() is None: # 프로세스가 실행 중이면
+        try:
+            # 멈춰있던 프로세스(input)에 사용자 입력값을 밀어넣기
+            process.stdin.write(f"{data}\n".encode('utf-8'))
+            process.stdin.flush()
+        except Exception as e:
+            emit('terminal_output', {'data': f'\n[Input Error] {e}\n'})
+    else:
+        emit('terminal_output', {'data': '\n[ERROR] No active process.\n'})
+
+
+# 12. 프론트엔드에서 'run_code' 이벤트를 보냈을 때
+@socketio.on('run_code')
+def handle_run_code(json_data):
+    sid = request.sid
+    
+    # 혹시 이전 프로세스가 남아있다면 종료
+    old_process = user_processes.pop(sid, None)
+    if old_process:
+        old_process.kill()
+        
+    code = json_data['code']
+    # 사용자의 코드 앞에 'input 가로채기' 코드를 붙임
+    full_code = hack_script + "\n" + code
+
+    # ================================================================
+    # !!!!!!!!!! 치명적인 보안 경고 (여전함) !!!!!!!!!!!
+    # 이 코드는 여전히 악성 코드에 취약합니다.
+    # 학습용으로만 사용하세요.
+    # ================================================================
+    
+    try:
+        process = subprocess.Popen(
+            [sys.executable, '-u', '-c', full_code],
+            stdin=subprocess.PIPE,   # ★★★ input()을 위해 'stdin' 파이프 추가
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            bufsize=1
+        )
+        
+        # 1. 새 프로세스를 딕셔너리에 저장
+        user_processes[sid] = process
+        
+        # 2. 메인 스레드를 막지 않도록, 백그라운드 스레드에서 출력 스트리밍 시작
+        socketio.start_background_task(
+            target=stream_output, 
+            process=process, 
+            sid=sid
+        )
 
     except Exception as e:
         emit('terminal_output', {'data': f'\n[Server Error] {str(e)}\n'})
-    
-    # 작업이 끝났으므로 프롬프트를 다시 보냅니다.
-    emit('terminal_output', {'data': 'impy> '})
-
-
-# 이 파일(app.py)을 로컬에서 직접 실행할 때 (테스트용)
-if __name__ == '__main__':
-    socketio.run(app, debug=True, port=5001)
+        emit('terminal_output', {'data': 'impy> '}) # 에러 발생 시 프롬프트 복구
